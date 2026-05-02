@@ -1,0 +1,4 @@
+name: hermes-claude-cli-mode
+description: Add Claude CLI mode for Hermes Anthropic provider calls.
+events:
+  - gateway:startup
