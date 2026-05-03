@@ -11,9 +11,10 @@ This hook is implemented and tested against the following baseline:
 
 | Component | Baseline |
 |-----------|----------|
+| Hook | `0.2.0` |
 | Claude Code CLI | `2.1.123` (`claude --version`) |
 | `hermes-agent` | `0.11.0`, `main` commit `d9bf09372` |
-| Verification date | `2026-05-01` |
+| Verification date | `2026-05-03` |
 
 Newer versions may work, but revalidate this hook when Claude CLI changes its
 `stream-json` protocol, permission prompt behavior, session flags, MCP flags, or
@@ -46,6 +47,7 @@ Initial support:
 - routes Claude CLI permission prompts through Hermes gateway approval when `permission_prompt_tool` is left empty
 - serializes Claude CLI invocations per Hermes client so one Claude session is not written by overlapping subprocesses
 - invalidates Claude CLI session state when Hermes rewrites, compresses, or resets the transcript
+- follows Hermes busy-input handling by aborting active Claude CLI processes on `interrupt`, preserving queued turns on `queue`, and letting Hermes deliver `steer` guidance at its normal injection point
 - patches known-problematic Hermes session_search/skills guidance wording at runtime to avoid a Claude Code CLI false positive
 - sends single-turn or latest-turn image input as native stream-json image blocks when possible
 - materializes image content into stable Claude Code `@file` references for flattened history prompts
@@ -286,6 +288,17 @@ argv, then relies on the live process state for later stdin turns. If Hermes is
 already in latest-user-only continuation mode but no live process is available,
 the hook falls back to a short-lived Claude CLI call with the normal session
 flags instead of starting a contextless live process.
+
+## Busy Input Modes
+
+Hermes owns `display.busy_input_mode`; this hook has no separate busy-input
+setting. CLI mode follows the same three Hermes modes:
+
+| Mode | Hook behavior |
+|------|---------------|
+| `interrupt` | Hermes calls `AIAgent.interrupt()`. The hook lets Hermes mark the run interrupted, then closes the active Claude CLI live session, terminates any active `claude -p` subprocess, and invalidates Claude CLI session state so the pending user message is answered in a fresh continuation. |
+| `queue` | Hermes leaves the active CLI turn running and queues the new message for the next Hermes turn. The next turn is routed through the same append-only/session checks as any other continuation. |
+| `steer` | Hermes stores the guidance and injects it at its normal tool-boundary injection point. If Hermes cannot inject it inside the current run, Hermes returns it as the next user turn; the hook then treats it like a normal queued continuation. |
 
 ## Model Names
 

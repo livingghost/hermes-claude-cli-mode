@@ -180,6 +180,25 @@ def _patch_aiagent_module(module: Any) -> bool:
         cls.reset_session_state = wrapped_reset_session_state
         logger.info("%s: patched %s.AIAgent.reset_session_state", HOOK_NAME, getattr(module, "__name__", "run_agent"))
 
+    original_interrupt = getattr(cls, "interrupt", None)
+    if original_interrupt is not None and not getattr(original_interrupt, PATCH_ATTR, False):
+
+        def wrapped_interrupt(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return original_interrupt(self, *args, **kwargs)
+            finally:
+                client = getattr(self, "_anthropic_client", None)
+                if isinstance(client, ClaudeCliAnthropicClient):
+                    try:
+                        client.abort_active_invocations(reason="agent-interrupt")
+                    except Exception:
+                        logger.debug("%s: failed to abort Claude CLI invocation on interrupt", HOOK_NAME, exc_info=True)
+
+        setattr(wrapped_interrupt, PATCH_ATTR, True)
+        setattr(wrapped_interrupt, ORIGINAL_ATTR, original_interrupt)
+        cls.interrupt = wrapped_interrupt
+        logger.info("%s: patched %s.AIAgent.interrupt", HOOK_NAME, getattr(module, "__name__", "run_agent"))
+
     original_rebuild = getattr(cls, "_rebuild_anthropic_client", None)
     if original_rebuild is not None and not getattr(original_rebuild, PATCH_ATTR, False):
 

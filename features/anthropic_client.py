@@ -83,14 +83,43 @@ class ClaudeCliAnthropicClient:
         self.closed = True
         self._close_live_session("client-close")
         _unregister_client_parent_session(self, self._parent_session_key)
+        self._terminate_active_processes("client-close")
+
+    def _terminate_active_processes(self, reason: str) -> None:
         with self._process_lock:
             processes = list(self._active_processes)
+        if processes:
+            logger.info(
+                "%s: terminating %d active Claude CLI process(es): %s",
+                HOOK_NAME,
+                len(processes),
+                reason,
+            )
         for process in processes:
             try:
                 if process.poll() is None:
                     process.terminate()
             except Exception:
                 pass
+
+    def abort_active_invocations(self, *, reason: str) -> None:
+        self.invalidate_cli_session(reason=reason, bump_epoch=True)
+        self._terminate_active_processes(reason)
+
+    def invocation_was_invalidated(self, invocation: _ClaudeCliInvocation | None) -> bool:
+        if invocation is None:
+            return False
+        if getattr(self.parent_agent, "_interrupt_requested", False):
+            return True
+        with self._state_lock:
+            return (
+                invocation.state_generation != self._state_generation
+                or invocation.parent_session_key != self._parent_session_key
+            )
+
+    def _raise_if_invocation_invalidated(self, invocation: _ClaudeCliInvocation) -> None:
+        if self.invocation_was_invalidated(invocation):
+            raise InterruptedError("Claude CLI invocation was interrupted or invalidated")
 
     def register_process(self, process: subprocess.Popen[str]) -> None:
         with self._process_lock:
@@ -520,6 +549,20 @@ class ClaudeCliAnthropicClient:
         stdout_done = object()
         stderr_done = object()
 
+        def abort_if_invalidated() -> None:
+            if not self.invocation_was_invalidated(invocation):
+                return
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
+            raise InterruptedError("Claude CLI invocation was interrupted or invalidated")
+
         def collect(pipe: Any, stream_name: str, done_marker: object) -> None:
             try:
                 if pipe is not None:
@@ -562,6 +605,7 @@ class ClaudeCliAnthropicClient:
             last_output_at = time.monotonic()
             done_markers: set[object] = set()
             while True:
+                abort_if_invalidated()
                 if len(done_markers) == 2 and process.poll() is not None:
                     break
                 wait_seconds = 0.25
@@ -597,6 +641,7 @@ class ClaudeCliAnthropicClient:
                 try:
                     item = output_queue.get(timeout=wait_seconds)
                 except queue.Empty:
+                    abort_if_invalidated()
                     continue
                 if item is stdout_done or item is stderr_done:
                     done_markers.add(item)
@@ -613,6 +658,7 @@ class ClaudeCliAnthropicClient:
             returncode = process.wait(timeout=5)
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
+            self._raise_if_invocation_invalidated(invocation)
             return SimpleNamespace(
                 returncode=returncode,
                 stdout="".join(stdout_parts),
@@ -647,11 +693,15 @@ class ClaudeCliAnthropicClient:
                     )
                 else:
                     completed = self._run_invocation(invocation)
+            except Exception:
+                self._raise_if_invocation_invalidated(invocation)
+                raise
             finally:
                 invocation.close()
 
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
+            self._raise_if_invocation_invalidated(invocation)
             if completed.returncode != 0:
                 detail = _redact_error(stderr.strip() or stdout.strip())
                 raise RuntimeError(f"Claude CLI failed with exit code {completed.returncode}: {detail}")

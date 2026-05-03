@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 HOOK_NAME = "hermes-claude-cli-mode"
+HOOK_VERSION = "0.2.0"
 CONFIG_KEY = "claude_cli"
 ANTHROPIC_API_BASE_URL = "https://api.anthropic.com"
 PATCH_ATTR = "_hermes_claude_cli_wrapped"

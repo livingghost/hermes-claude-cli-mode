@@ -160,6 +160,13 @@ class _ClaudeCliLiveSession:
         session_id = ""
         success = False
         try:
+            def abort_if_invalidated() -> None:
+                if not self._client.invocation_was_invalidated(invocation):
+                    return
+                self.close("invocation-invalidated")
+                raise InterruptedError("Claude CLI invocation was interrupted or invalidated")
+
+            abort_if_invalidated()
             self._write_input(invocation.stdin_text)
             deadline = (
                 time.monotonic() + self._client.config.timeout_seconds
@@ -169,6 +176,7 @@ class _ClaudeCliLiveSession:
             no_output_timeout = invocation.no_output_timeout_seconds
             last_output_at = time.monotonic()
             while True:
+                abort_if_invalidated()
                 wait_seconds = 0.25
                 now = time.monotonic()
                 if deadline is not None:
@@ -192,6 +200,7 @@ class _ClaudeCliLiveSession:
                 try:
                     item = self._output_queue.get(timeout=wait_seconds)
                 except queue.Empty:
+                    abort_if_invalidated()
                     if self._process.poll() is not None:
                         self.close("exited")
                         detail = _redact_error("".join(self._stderr_parts[stderr_start:]).strip())
@@ -247,6 +256,7 @@ class _ClaudeCliLiveSession:
                     success = True
                     break
 
+            abort_if_invalidated()
             self._client.record_invocation_success(session_id, invocation)
             if not stdout_lines:
                 stderr = "".join(self._stderr_parts[stderr_start:]).strip()

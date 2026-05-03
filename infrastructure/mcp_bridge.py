@@ -16,6 +16,7 @@ from typing import Any
 from domain.config import TransportConfig
 from domain.constants import (
     HOOK_NAME,
+    HOOK_VERSION,
     MCP_ALLOWED_TOOLS,
     MCP_PERMISSION_PROMPT_TOOL,
     MCP_SERVER_NAME,
@@ -583,7 +584,7 @@ class _McpBridgeHTTPServer(ThreadingHTTPServer):
 
 
 class _McpBridgeRequestHandler(BaseHTTPRequestHandler):
-    server_version = "HermesClaudeCliMCP/0.1"
+    server_version = f"HermesClaudeCliMCP/{HOOK_VERSION}"
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug("%s: MCP HTTP: " + format, HOOK_NAME, *args)
@@ -751,7 +752,7 @@ class _McpBridgeManager:
                 {
                     "protocolVersion": protocol_version,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "hermes", "version": "0.1.0"},
+                    "serverInfo": {"name": "hermes", "version": HOOK_VERSION},
                 },
             )
         if method in {"notifications/initialized", "notifications/cancelled"}:

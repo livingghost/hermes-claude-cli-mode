@@ -184,7 +184,7 @@ def _top_level_core_imports(tree):
     return imports & FORBIDDEN_TOP_LEVEL_CORE_IMPORTS
 
 
-def test_hook_root_uses_memory_lancedb_style_layers_without_package_wrapper():
+def test_hook_root_uses_layered_layout_without_package_wrapper():
     source_dirs = {
         path.name
         for path in HOOK_DIR.iterdir()

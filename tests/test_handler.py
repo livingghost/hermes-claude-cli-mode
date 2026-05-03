@@ -5,9 +5,11 @@ import importlib.util
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import uuid
 from pathlib import Path
@@ -152,6 +154,10 @@ def make_fake_run_agent_module():
         def reset_session_state(self):
             return "reset"
 
+        def interrupt(self, message=None):
+            self._interrupt_requested = True
+            self._interrupt_message = message
+
         def _rebuild_anthropic_client(self):
             from agent.anthropic_adapter import build_anthropic_client
 
@@ -292,6 +298,35 @@ def test_config_api_mode_cli_selects_cli_client_without_native_anthropic_leak(mo
     assert agent._claude_cli_enabled is True
     assert agent._claude_cli_mode_requested is True
     assert agent._primary_runtime["claude_cli_mode_requested"] is True
+    agent._anthropic_client.close()
+
+
+def test_cli_mode_interrupt_aborts_active_cli_invocation_after_core_interrupt(monkeypatch):
+    install_config(
+        monkeypatch,
+        {"provider": "anthropic", "default": "claude-opus-4-7", "api_mode": "cli"},
+    )
+    install_anthropic_adapter(monkeypatch, object())
+    handler = load_handler(monkeypatch)
+    assert handler._patch_anthropic_adapter() is True
+    run_agent = make_fake_run_agent_module()
+    assert handler._patch_aiagent_module(run_agent) is True
+
+    agent = run_agent.AIAgent(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model="claude-opus-4-7",
+    )
+    calls = []
+
+    def abort_active_invocations(*, reason):
+        calls.append((reason, agent._interrupt_requested, agent._interrupt_message))
+
+    agent._anthropic_client.abort_active_invocations = abort_active_invocations
+
+    agent.interrupt("new instruction")
+
+    assert calls == [("agent-interrupt", True, "new instruction")]
     agent._anthropic_client.close()
 
 
@@ -868,6 +903,106 @@ def test_create_message_uses_cli_reported_model(monkeypatch, tmp_path):
         )
         assert message.model == "claude-opus-4-7"
     finally:
+        client.close()
+
+
+def test_create_message_reports_invalidated_cli_invocation_as_interrupted(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    config = handler.TransportConfig(config_dir=str(tmp_path), session_mode="off")
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+
+    def run_and_abort(invocation):
+        client.abort_active_invocations(reason="agent-interrupt")
+        return types.SimpleNamespace(returncode=-15, stdout="", stderr="terminated")
+
+    monkeypatch.setattr(client, "_run_invocation", run_and_abort)
+
+    try:
+        with pytest.raises(InterruptedError, match="interrupted or invalidated"):
+            client.messages.create(
+                model="claude-opus-4-7",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+    finally:
+        client.close()
+
+
+def test_create_message_respects_parent_interrupt_even_before_state_generation_changes(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    config = handler.TransportConfig(config_dir=str(tmp_path), session_mode="off")
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+        _interrupt_requested=False,
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+
+    def run_and_mark_interrupted(invocation):
+        parent._interrupt_requested = True
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"type": "result", "result": "stale response"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(client, "_run_invocation", run_and_mark_interrupted)
+
+    try:
+        with pytest.raises(InterruptedError, match="interrupted or invalidated"):
+            client.messages.create(
+                model="claude-opus-4-7",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+    finally:
+        client.close()
+
+
+def test_run_invocation_aborts_promptly_when_invocation_is_invalidated(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    config = handler.TransportConfig(config_dir=str(tmp_path), session_mode="off", timeout_seconds=10)
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+    invocation = handler._ClaudeCliInvocation(
+        args=[sys.executable, "-c", "import time; time.sleep(30)"],
+        env=dict(os.environ),
+        stdin_text="",
+        cleanup_callbacks=[],
+        full_prompt="waiting",
+        latest_user_only=False,
+        request_fingerprint="fingerprint",
+        parent_session_key="hermes-session",
+        cli_session_id="",
+        state_generation=0,
+        no_output_timeout_seconds=9,
+    )
+    started = threading.Event()
+
+    def invalidate_after_process_registers(process):
+        original_register_process(process)
+        started.set()
+        client.abort_active_invocations(reason="agent-interrupt")
+
+    original_register_process = client.register_process
+    monkeypatch.setattr(client, "register_process", invalidate_after_process_registers)
+
+    try:
+        started_at = time.monotonic()
+        with pytest.raises(InterruptedError, match="interrupted or invalidated"):
+            client._run_invocation(invocation)
+        assert started.is_set()
+        assert time.monotonic() - started_at < 3
+    finally:
+        invocation.close()
         client.close()
 
 
@@ -1594,6 +1729,49 @@ def test_run_invocation_kills_silent_process_after_no_output_watchdog(monkeypatc
         client.close()
 
 
+def test_abort_active_invocations_invalidates_session_and_terminates_process(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    config = handler.TransportConfig(config_dir=str(tmp_path), session_mode="session-id")
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    client.register_process(process)
+    with client._state_lock:
+        client._claude_session_started = True
+        client._claude_session_id = "stale-session"
+        client._last_full_prompt = "previous prompt"
+        client._last_request_fingerprint = "previous fingerprint"
+        previous_epoch = client._session_epoch
+        previous_generation = client._state_generation
+
+    try:
+        client.abort_active_invocations(reason="agent-interrupt")
+        process.wait(timeout=5)
+
+        assert process.poll() is not None
+        assert client._claude_session_started is False
+        assert client._claude_session_id == ""
+        assert client._last_full_prompt == ""
+        assert client._session_epoch == previous_epoch + 1
+        assert client._state_generation == previous_generation + 1
+    finally:
+        try:
+            if process.poll() is None:
+                process.kill()
+        finally:
+            client.unregister_process(process)
+            client.close()
+
+
 def test_live_session_reuses_process_and_owns_startup_artifacts(monkeypatch, tmp_path):
     handler = load_handler(monkeypatch)
     script = tmp_path / "fake_live_cli.py"
@@ -1681,6 +1859,66 @@ def test_live_session_reuses_process_and_owns_startup_artifacts(monkeypatch, tmp
         client.close()
 
     assert cleanup_calls == ["turn", "startup"]
+
+
+def test_live_session_reports_parent_interrupt_as_interrupted(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    script = tmp_path / "fake_live_wait_cli.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "import time",
+                "for _raw in sys.stdin:",
+                "    time.sleep(30)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = handler.TransportConfig(config_dir=str(tmp_path), timeout_seconds=10)
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+        _interrupt_requested=False,
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+    cleanup_calls = []
+    invocation = handler._ClaudeCliInvocation(
+        args=[sys.executable, "-u", str(script)],
+        env=dict(os.environ),
+        stdin_text=handler._build_stream_json_input("hello"),
+        cleanup_callbacks=[lambda: cleanup_calls.append("startup")],
+        full_prompt="hello",
+        latest_user_only=False,
+        request_fingerprint="fingerprint",
+        parent_session_key="hermes-session",
+        cli_session_id="cli-session",
+        state_generation=0,
+        no_output_timeout_seconds=9,
+    )
+    session = handler._ClaudeCliLiveSession(
+        client=client,
+        invocation=invocation,
+        args=invocation.args,
+        fingerprint="fingerprint",
+    )
+    timer = threading.Timer(0.05, lambda: setattr(parent, "_interrupt_requested", True))
+
+    try:
+        timer.start()
+        started_at = time.monotonic()
+        with pytest.raises(InterruptedError, match="interrupted or invalidated"):
+            for _ in session.iter_turn(invocation, lambda line: None):
+                pass
+        assert time.monotonic() - started_at < 3
+        assert session.is_running() is False
+        assert cleanup_calls == ["startup"]
+    finally:
+        timer.cancel()
+        invocation.close()
+        session.close("test")
+        client.close()
 
 
 def test_live_session_error_includes_cli_auth_and_rate_limit_diagnostics(monkeypatch, tmp_path):
@@ -1852,6 +2090,46 @@ def test_stream_context_can_use_live_session(monkeypatch, tmp_path):
         assert events[0].delta.text == "hello"
         assert message.content[0].text == "hello"
     finally:
+        client.close()
+
+
+def test_stream_context_reports_parent_interrupt_as_interrupted(monkeypatch, tmp_path):
+    handler = load_handler(monkeypatch)
+    script = tmp_path / "fake_stream_wait_cli.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    config = handler.TransportConfig(config_dir=str(tmp_path), session_mode="off", timeout_seconds=10)
+    parent = types.SimpleNamespace(
+        model="claude-opus-4-7",
+        session_id="hermes-session",
+        valid_tool_names=set(),
+        _interrupt_requested=False,
+    )
+    client = handler.ClaudeCliAnthropicClient(parent_agent=parent, config=config)
+    invocation = handler._ClaudeCliInvocation(
+        args=[sys.executable, "-u", str(script)],
+        env=dict(os.environ),
+        stdin_text=handler._build_stream_json_input("hello"),
+        cleanup_callbacks=[],
+        full_prompt="hello",
+        latest_user_only=False,
+        request_fingerprint="fingerprint",
+        parent_session_key="hermes-session",
+        cli_session_id="",
+        state_generation=0,
+        no_output_timeout_seconds=9,
+    )
+    monkeypatch.setattr(client, "prepare_invocation", lambda api_kwargs, force_streaming=False: invocation)
+    timer = threading.Timer(0.05, lambda: setattr(parent, "_interrupt_requested", True))
+
+    try:
+        timer.start()
+        started_at = time.monotonic()
+        with pytest.raises(InterruptedError, match="interrupted or invalidated"):
+            with client.messages.stream(model="claude-opus-4-7", messages=[]) as stream:
+                list(stream)
+        assert time.monotonic() - started_at < 3
+    finally:
+        timer.cancel()
         client.close()
 
 

@@ -151,8 +151,8 @@ class _ClaudeCliStream:
                     usage=self._usage,
                 )
         except Exception as exc:
-            self._error = exc
-            raise
+            self._error = self._interrupted_error_if_invalidated() or exc
+            raise self._error
         finally:
             self._cleanup()
 
@@ -190,7 +190,25 @@ class _ClaudeCliStream:
             assert self._invocation is not None
             no_output_timeout = self._invocation.no_output_timeout_seconds
             last_output_at = time.monotonic()
+
+            def abort_if_invalidated() -> None:
+                interrupted = self._interrupted_error_if_invalidated()
+                if interrupted is None:
+                    return
+                self._error = interrupted
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+                raise interrupted
+
             while True:
+                abort_if_invalidated()
                 wait_seconds = 0.25
                 now = time.monotonic()
                 if deadline is not None:
@@ -232,6 +250,7 @@ class _ClaudeCliStream:
                 try:
                     queued = stdout_queue.get(timeout=wait_seconds)
                 except queue.Empty:
+                    abort_if_invalidated()
                     continue
                 if queued is stdout_done:
                     break
@@ -257,6 +276,7 @@ class _ClaudeCliStream:
             if self._stderr_thread is not None:
                 self._stderr_thread.join(timeout=1)
             stderr = "".join(self._stderr_parts)
+            abort_if_invalidated()
             if returncode != 0:
                 detail = _redact_error(stderr.strip())
                 self._error = RuntimeError(f"Claude CLI failed with exit code {returncode}: {detail}")
@@ -330,6 +350,11 @@ class _ClaudeCliStream:
 
     def _response_model(self) -> str:
         return self._model_id or self._client.current_model(self._api_kwargs)
+
+    def _interrupted_error_if_invalidated(self) -> InterruptedError | None:
+        if self._client.invocation_was_invalidated(self._invocation):
+            return InterruptedError("Claude CLI invocation was interrupted or invalidated")
+        return None
 
     def _cleanup(self) -> None:
         process = self._process
