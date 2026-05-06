@@ -11,10 +11,10 @@ This hook is implemented and tested against the following baseline:
 
 | Component | Baseline |
 |-----------|----------|
-| Hook | `0.2.0` |
+| Hook | `0.2.1` |
 | Claude Code CLI | `2.1.123` (`claude --version`) |
 | `hermes-agent` | `0.11.0`, `main` commit `d9bf09372` |
-| Verification date | `2026-05-03` |
+| Verification date | `2026-05-07` |
 
 Newer versions may work, but revalidate this hook when Claude CLI changes its
 `stream-json` protocol, permission prompt behavior, session flags, MCP flags, or
