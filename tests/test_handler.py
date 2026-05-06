@@ -1,4 +1,5 @@
 import base64
+import builtins
 import importlib
 import importlib.machinery
 import importlib.util
@@ -19,6 +20,21 @@ import pytest
 
 HOOK_DIR = Path(__file__).resolve().parents[1]
 HANDLER_PATH = HOOK_DIR / "handler.py"
+IMPORT_FINDER_ATTR = "_hermes_claude_cli_import_finder"
+IMPORT_WRAPPER_ATTR = "_hermes_claude_cli_import_wrapper"
+
+
+@pytest.fixture(autouse=True)
+def restore_import_hooks():
+    original_import = builtins.__import__
+    original_meta_path = list(sys.meta_path)
+    yield
+    builtins.__import__ = original_import
+    sys.meta_path[:] = original_meta_path
+    for attr in (IMPORT_FINDER_ATTR, IMPORT_WRAPPER_ATTR):
+        if hasattr(sys, attr):
+            delattr(sys, attr)
+    sys.modules.pop("run_agent", None)
 
 
 def load_handler(monkeypatch):
@@ -196,6 +212,40 @@ def make_fake_run_agent_module():
 
     module.AIAgent = AIAgent
     return module
+
+
+def write_fake_run_agent_file(tmp_path):
+    run_agent_path = tmp_path / "run_agent.py"
+    run_agent_path.write_text(
+        "\n".join(
+            [
+                "class AIAgent:",
+                "    def __init__(self, base_url=None, api_key=None, provider=None, api_mode=None, model='', **kwargs):",
+                "        self.provider = provider or ''",
+                "        self.api_mode = api_mode or ''",
+                "        self.model = model",
+                "        self.session_id = kwargs.get('session_id') or 'session'",
+                "        from agent.anthropic_adapter import build_anthropic_client",
+                "        self._anthropic_client = build_anthropic_client(api_key or 'key', base_url)",
+                "    def _try_refresh_anthropic_client_credentials(self):",
+                "        return True",
+                "    def reset_session_state(self):",
+                "        return 'reset'",
+                "    def _rebuild_anthropic_client(self):",
+                "        return None",
+                "    def _swap_credential(self, entry):",
+                "        return None",
+                "    def _restore_primary_runtime(self):",
+                "        return True",
+                "    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):",
+                "        return None",
+                "    def close(self):",
+                "        return None",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return run_agent_path
 
 
 def install_fake_approval_module(monkeypatch, *, choice="once", config=None):
@@ -475,36 +525,7 @@ def test_run_agent_import_hook_chains_after_delegating_gateway_event_filter_find
     )
     install_anthropic_adapter(monkeypatch, object())
     handler = load_handler(monkeypatch)
-    run_agent_path = tmp_path / "run_agent.py"
-    run_agent_path.write_text(
-        "\n".join(
-            [
-                "class AIAgent:",
-                "    def __init__(self, base_url=None, api_key=None, provider=None, api_mode=None, model='', **kwargs):",
-                "        self.provider = provider or ''",
-                "        self.api_mode = api_mode or ''",
-                "        self.model = model",
-                "        self.session_id = kwargs.get('session_id') or 'session'",
-                "        from agent.anthropic_adapter import build_anthropic_client",
-                "        self._anthropic_client = build_anthropic_client(api_key or 'key', base_url)",
-                "    def _try_refresh_anthropic_client_credentials(self):",
-                "        return True",
-                "    def reset_session_state(self):",
-                "        return 'reset'",
-                "    def _rebuild_anthropic_client(self):",
-                "        return None",
-                "    def _swap_credential(self, entry):",
-                "        return None",
-                "    def _restore_primary_runtime(self):",
-                "        return True",
-                "    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):",
-                "        return None",
-                "    def close(self):",
-                "        return None",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    write_fake_run_agent_file(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
 
     class GatewayEventFilterFinder:
@@ -549,6 +570,98 @@ def test_run_agent_import_hook_chains_after_delegating_gateway_event_filter_find
     assert isinstance(agent._anthropic_client, handler.ClaudeCliAnthropicClient)
     assert agent._claude_cli_enabled is True
     agent._anthropic_client.close()
+
+
+def test_module_import_hook_uses_pathfinder_without_delegating_to_other_finders(monkeypatch, tmp_path):
+    install_config(
+        monkeypatch,
+        {"provider": "anthropic", "default": "claude-opus-4-7", "api_mode": "cli"},
+    )
+    install_anthropic_adapter(monkeypatch, object())
+    handler = load_handler(monkeypatch)
+    write_fake_run_agent_file(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    class SentinelFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "run_agent":
+                raise AssertionError("Claude CLI mode finder must not delegate to unrelated meta path finders")
+            return None
+
+    assert handler._patch_anthropic_adapter() is True
+    assert handler._patch_aiagent() is True
+    sys.meta_path.insert(1, SentinelFinder())
+
+    imported = importlib.import_module("run_agent")
+    agent = imported.AIAgent(provider="anthropic", api_mode="cli", model="claude-opus-4-7")
+
+    assert isinstance(agent._anthropic_client, handler.ClaudeCliAnthropicClient)
+    assert agent._claude_cli_enabled is True
+    agent._anthropic_client.close()
+
+
+def test_builtin_import_hook_patches_after_pathfinder_based_hook_loads_run_agent(monkeypatch, tmp_path):
+    install_config(
+        monkeypatch,
+        {"provider": "anthropic", "default": "claude-opus-4-7", "api_mode": "cli"},
+    )
+    install_anthropic_adapter(monkeypatch, object())
+    handler = load_handler(monkeypatch)
+    write_fake_run_agent_file(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    class PathFinderBasedGatewayFinder:
+        _gateway_event_filter_import_finder = True
+
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != "run_agent":
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is None or spec.loader is None:
+                return spec
+            spec.loader = GatewayEventFilterLoader(spec.loader)
+            return spec
+
+    class GatewayEventFilterLoader:
+        def __init__(self, wrapped_loader):
+            self._wrapped_loader = wrapped_loader
+
+        def create_module(self, spec):
+            create_module = getattr(self._wrapped_loader, "create_module", None)
+            return create_module(spec) if create_module is not None else None
+
+        def exec_module(self, module):
+            self._wrapped_loader.exec_module(module)
+            module.gateway_event_filter_loader_ran = True
+
+    assert handler._patch_anthropic_adapter() is True
+    assert handler._patch_aiagent() is True
+    assert handler.hook._PATCH_PENDING is True
+    sys.meta_path.insert(0, PathFinderBasedGatewayFinder())
+
+    imported = __import__("run_agent", fromlist=["AIAgent"])
+    agent = imported.AIAgent(provider="anthropic", api_mode="cli", model="claude-opus-4-7")
+
+    assert imported.gateway_event_filter_loader_ran is True
+    assert handler.hook._PATCH_PENDING is False
+    assert isinstance(agent._anthropic_client, handler.ClaudeCliAnthropicClient)
+    assert agent._claude_cli_enabled is True
+    agent._anthropic_client.close()
+
+
+def test_builtin_import_hook_ignores_unrelated_imports(monkeypatch):
+    handler = load_handler(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        handler.hook,
+        "_patch_imported_modules_for_import",
+        lambda name, fromlist=(): calls.append((name, tuple(fromlist or ()))),
+    )
+
+    assert handler._install_builtin_import_hook() is True
+    __import__("json")
+
+    assert calls == []
 
 
 def test_plain_anthropic_messages_uses_native_client(monkeypatch):

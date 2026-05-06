@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.abc
+import importlib.machinery
 import logging
 import os
 import sys
@@ -15,6 +17,7 @@ from domain.config import _coerce_bool
 from domain.constants import (
     HOOK_NAME,
     IMPORT_FINDER_ATTR,
+    IMPORT_WRAPPER_ATTR,
     ORIGINAL_ATTR,
     PATCH_ATTR,
     SKIP_IMPORT_BOOTSTRAP_ENV,
@@ -71,6 +74,7 @@ _IMPORT_PATCH_MODULES = (
     | _PROMPT_GUIDANCE_MODULES
 )
 _PATCH_PENDING = False
+_IMPORT_WRAPPER_LOCK = threading.RLock()
 
 
 def _patch_prompt_guidance_modules(*modules: Any) -> bool:
@@ -433,6 +437,39 @@ def _patch_imported_module(module: Any) -> bool:
     return patched
 
 
+def _patch_imported_modules_for_import(name: str, fromlist: Any = ()) -> None:
+    global _PATCH_PENDING
+    if not name:
+        return
+    candidates = {name}
+    if fromlist:
+        for item in fromlist:
+            if isinstance(item, str) and item and item != "*":
+                candidates.add(f"{name}.{item}")
+    for module_name in candidates:
+        if module_name not in _IMPORT_PATCH_MODULES:
+            continue
+        module = sys.modules.get(module_name)
+        if module is not None and _patch_imported_module(module) and module_name in _RUN_AGENT_IMPORT_MODULES:
+            _PATCH_PENDING = False
+
+
+def _import_may_have_patch_target(name: str, fromlist: Any = ()) -> bool:
+    if not name:
+        return False
+    if name in _IMPORT_PATCH_MODULES:
+        return True
+    if not fromlist:
+        return False
+    return any(
+        isinstance(item, str)
+        and item
+        and item != "*"
+        and f"{name}.{item}" in _IMPORT_PATCH_MODULES
+        for item in fromlist
+    )
+
+
 class _ModulePatchLoader(importlib.abc.Loader):
     def __init__(self, wrapped_loader: importlib.abc.Loader):
         self._wrapped_loader = wrapped_loader
@@ -452,22 +489,13 @@ class _ModulePatchFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
         if fullname not in _IMPORT_PATCH_MODULES:
             return None
-        for finder in sys.meta_path:
-            if finder is self:
-                continue
-            if getattr(finder, "_gateway_event_filter_import_finder", False):
-                continue
-            find_spec = getattr(finder, "find_spec", None)
-            if find_spec is None:
-                continue
-            spec = find_spec(fullname, path, target)
-            if spec is None or spec.loader is None:
-                continue
-            if isinstance(spec.loader, _ModulePatchLoader):
-                return spec
-            spec.loader = _ModulePatchLoader(spec.loader)
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is None or spec.loader is None:
             return spec
-        return None
+        if isinstance(spec.loader, _ModulePatchLoader):
+            return spec
+        spec.loader = _ModulePatchLoader(spec.loader)
+        return spec
 
 
 def _install_module_import_hook() -> bool:
@@ -480,6 +508,45 @@ def _install_module_import_hook() -> bool:
     return True
 
 
+def _install_builtin_import_hook() -> bool:
+    with _IMPORT_WRAPPER_LOCK:
+        if getattr(sys, IMPORT_WRAPPER_ATTR, None) is not None:
+            return True
+        original_import = builtins.__import__
+
+        # Some Hermes hooks resolve run_agent via PathFinder before this meta-path
+        # finder sees it. Patch exact target modules after absolute imports return.
+        def wrapped_import(
+            name: str,
+            globals: Any = None,
+            locals: Any = None,
+            fromlist: Any = (),
+            level: int = 0,
+        ) -> Any:
+            should_patch = level == 0 and _import_may_have_patch_target(name, fromlist)
+            module = original_import(name, globals, locals, fromlist, level)
+            if should_patch:
+                try:
+                    _patch_imported_modules_for_import(name, fromlist)
+                except Exception:
+                    logger.debug("%s: failed to patch module after import: %s", HOOK_NAME, name, exc_info=True)
+            return module
+
+        setattr(wrapped_import, PATCH_ATTR, True)
+        setattr(wrapped_import, ORIGINAL_ATTR, original_import)
+        builtins.__import__ = wrapped_import
+        setattr(sys, IMPORT_WRAPPER_ATTR, wrapped_import)
+        logger.info("%s: installed builtin import patch hook", HOOK_NAME)
+        return True
+
+
+def _install_import_hooks(*, post_import_patch: bool = False) -> bool:
+    installed = _install_module_import_hook()
+    if post_import_patch:
+        installed = _install_builtin_import_hook() and installed
+    return installed
+
+
 def _patch_aiagent() -> bool:
     global _PATCH_PENDING
     patched = False
@@ -489,7 +556,7 @@ def _patch_aiagent() -> bool:
             patched = True
     if not patched:
         _PATCH_PENDING = True
-        _install_module_import_hook()
+        _install_import_hooks(post_import_patch=True)
     else:
         _PATCH_PENDING = False
     return patched or _PATCH_PENDING
@@ -501,7 +568,7 @@ def _patch_gateway_modules() -> bool:
         module = sys.modules.get(module_name)
         if module is not None and _patch_imported_module(module):
             patched = True
-    _install_module_import_hook()
+    _install_import_hooks()
     return patched
 
 
@@ -511,7 +578,7 @@ def _patch_runtime_provider() -> bool:
         module = sys.modules.get(module_name)
         if module is not None and _patch_imported_module(module):
             patched = True
-    _install_module_import_hook()
+    _install_import_hooks()
     return patched
 
 
@@ -521,7 +588,7 @@ def _patch_auxiliary_client() -> bool:
         module = sys.modules.get(module_name)
         if module is not None and _patch_imported_module(module):
             patched = True
-    _install_module_import_hook()
+    _install_import_hooks()
     return patched
 
 
