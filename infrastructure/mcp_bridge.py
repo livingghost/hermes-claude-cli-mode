@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -28,6 +29,45 @@ from .claude_cli import (
 )
 
 logger = logging.getLogger(__name__)
+
+_EXECUTE_CODE_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "hermes_claude_cli_mcp_execute_code_timeout",
+    default=None,
+)
+_CODE_EXECUTION_PATCH_ATTR = "__hermes_claude_cli_mcp_timeout_patch__"
+_CODE_EXECUTION_ORIGINAL_ATTR = "__hermes_claude_cli_original_load_config__"
+_CODE_EXECUTION_PATCH_LOCK = threading.Lock()
+
+
+def _install_execute_code_timeout_patch() -> bool:
+    """Install a hook-scoped timeout override for MCP execute_code calls."""
+    try:
+        from tools import code_execution_tool
+    except Exception:
+        logger.debug("%s: failed to import code_execution_tool for MCP timeout override", HOOK_NAME, exc_info=True)
+        return False
+
+    with _CODE_EXECUTION_PATCH_LOCK:
+        original_load_config = getattr(code_execution_tool, "_load_config", None)
+        if not callable(original_load_config):
+            return False
+        if getattr(original_load_config, _CODE_EXECUTION_PATCH_ATTR, False):
+            return True
+
+        def patched_load_config(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            cfg = original_load_config(*args, **kwargs)
+            cfg = dict(cfg) if isinstance(cfg, dict) else {}
+            timeout = _EXECUTE_CODE_TIMEOUT_OVERRIDE.get()
+            if isinstance(timeout, (int, float)) and timeout > 0:
+                cfg["timeout"] = float(timeout)
+            return cfg
+
+        setattr(patched_load_config, _CODE_EXECUTION_PATCH_ATTR, True)
+        setattr(patched_load_config, _CODE_EXECUTION_ORIGINAL_ATTR, original_load_config)
+        code_execution_tool._load_config = patched_load_config
+        logger.info("%s: patched execute_code config loader for MCP timeout override", HOOK_NAME)
+        return True
+
 
 def _json_rpc_result(request_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id if request_id is not None else None, "result": result}
@@ -531,6 +571,7 @@ class _McpBridgeContext:
 
         approval_token = None
         activity_callback_set = False
+        timeout_override_token = None
         try:
             try:
                 from tools.approval import set_current_session_key
@@ -552,6 +593,17 @@ class _McpBridgeContext:
             except Exception:
                 activity_callback_set = False
 
+            if dispatch_name == "execute_code":
+                timeout_seconds = getattr(self.config, "mcp_execute_code_timeout_seconds", 0)
+                if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+                    if _install_execute_code_timeout_patch():
+                        timeout_override_token = _EXECUTE_CODE_TIMEOUT_OVERRIDE.set(float(timeout_seconds))
+                    else:
+                        logger.debug(
+                            "%s: MCP execute_code timeout override unavailable",
+                            HOOK_NAME,
+                        )
+
             result = parent_agent._invoke_tool(dispatch_name, arguments, task_id, tool_call_id=tool_call_id)
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=True)
             text = _trim_mcp_tool_result(text, self.config.mcp_tool_result_char_limit)
@@ -559,6 +611,11 @@ class _McpBridgeContext:
         except Exception as exc:
             return {"content": [{"type": "text", "text": str(exc) or "tool execution failed"}], "isError": True}
         finally:
+            if timeout_override_token is not None:
+                try:
+                    _EXECUTE_CODE_TIMEOUT_OVERRIDE.reset(timeout_override_token)
+                except Exception:
+                    pass
             if activity_callback_set:
                 try:
                     from tools.environments.base import set_activity_callback
@@ -590,12 +647,23 @@ class _McpBridgeRequestHandler(BaseHTTPRequestHandler):
         logger.debug("%s: MCP HTTP: " + format, HOOK_NAME, *args)
 
     def _write_json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            logger.debug("%s: MCP client disconnected before JSON response was written", HOOK_NAME, exc_info=True)
+
+    def _write_empty(self, status: int) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            logger.debug("%s: MCP client disconnected before empty response was written", HOOK_NAME, exc_info=True)
 
     def do_POST(self) -> None:
         if self.path.rstrip("/") != "/mcp":
@@ -635,8 +703,7 @@ class _McpBridgeRequestHandler(BaseHTTPRequestHandler):
                 responses.append(response)
 
         if not responses:
-            self.send_response(202)
-            self.end_headers()
+            self._write_empty(202)
             return
         self._write_json(200, responses if isinstance(parsed, list) else responses[0])
 

@@ -48,6 +48,7 @@ class TransportConfig:
         "claude_code_mcp_enabled",
         "max_mcp_output_tokens",
         "mcp_tool_result_char_limit",
+        "mcp_execute_code_timeout_seconds",
         "add_dirs",
         "plugin_dirs",
         "debug_filter",
@@ -91,6 +92,7 @@ class TransportConfig:
         claude_code_mcp_enabled: bool = True,
         max_mcp_output_tokens: int = 0,
         mcp_tool_result_char_limit: int = 0,
+        mcp_execute_code_timeout_seconds: float = 45.0,
         add_dirs: tuple[str, ...] = (),
         plugin_dirs: tuple[str, ...] = (),
         debug_filter: str = "",
@@ -149,6 +151,10 @@ class TransportConfig:
         self.claude_code_mcp_enabled = _coerce_bool(claude_code_mcp_enabled, default=True)
         self.max_mcp_output_tokens = _coerce_int(max_mcp_output_tokens, 0)
         self.mcp_tool_result_char_limit = _coerce_int(mcp_tool_result_char_limit, 0)
+        self.mcp_execute_code_timeout_seconds = _coerce_float(
+            mcp_execute_code_timeout_seconds,
+            45.0,
+        )
         self.add_dirs = _coerce_str_tuple(add_dirs)
         self.plugin_dirs = _coerce_str_tuple(plugin_dirs)
         self.debug_filter = _coerce_optional_str(debug_filter)
@@ -385,6 +391,10 @@ def _load_runtime_config() -> TransportConfig:
         claude_code_mcp_enabled=_coerce_bool(raw.get("claude_code_mcp_enabled"), default=True),
         max_mcp_output_tokens=_coerce_int(raw.get("max_mcp_output_tokens"), 0),
         mcp_tool_result_char_limit=_coerce_int(raw.get("mcp_tool_result_char_limit"), 0),
+        mcp_execute_code_timeout_seconds=_coerce_float(
+            raw.get("mcp_execute_code_timeout_seconds"),
+            45.0,
+        ),
         add_dirs=_coerce_str_tuple(raw.get("add_dirs")),
         plugin_dirs=_coerce_str_tuple(raw.get("plugin_dirs")),
         debug_filter=_coerce_optional_str(raw.get("debug_filter")),

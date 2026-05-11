@@ -2500,6 +2500,41 @@ def test_mcp_bridge_dispatches_hermes_tool_call_with_generated_tool_call_id(monk
     assert calls[-1][3].startswith("mcp-")
 
 
+def test_mcp_bridge_overrides_execute_code_timeout_only_during_call(monkeypatch):
+    handler = load_handler(monkeypatch)
+
+    tools_pkg = types.ModuleType("tools")
+    code_execution_mod = types.ModuleType("tools.code_execution_tool")
+    code_execution_mod._load_config = lambda: {"timeout": 300, "mode": "project"}
+    tools_pkg.code_execution_tool = code_execution_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", code_execution_mod)
+
+    class Parent:
+        session_id = "synthetic-session"
+        valid_tool_names = {"execute_code"}
+
+        def _touch_activity(self):
+            pass
+
+        def _invoke_tool(self, name, arguments, task_id, tool_call_id=None):
+            assert name == "execute_code"
+            return code_execution_mod._load_config()
+
+    context = handler._McpBridgeContext(
+        parent_agent=Parent(),
+        tools=[],
+        dispatch_by_exposed={"execute_code": "execute_code"},
+        config=handler.TransportConfig(mcp_execute_code_timeout_seconds=12),
+    )
+
+    result = context.call_tool("execute_code", {"code": "print('ok')"})
+
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == {"timeout": 12.0, "mode": "project"}
+    assert code_execution_mod._load_config() == {"timeout": 300, "mode": "project"}
+
+
 def test_permission_prompt_tool_routes_approval_result_to_claude_cli(monkeypatch):
     handler = load_handler(monkeypatch)
     fake_approval = install_fake_approval_module(monkeypatch, choice="once")

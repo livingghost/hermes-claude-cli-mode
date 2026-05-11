@@ -173,6 +173,7 @@ claude_cli:
   claude_code_mcp_enabled: true
   max_mcp_output_tokens: 0
   mcp_tool_result_char_limit: 0
+  mcp_execute_code_timeout_seconds: 45
   add_dirs: []
   plugin_dirs: []
   debug_filter: ""
@@ -215,6 +216,7 @@ claude_cli:
 | `claude_code_mcp_enabled` | boolean | `true` | `false` | Allows Claude Code CLI to also load MCP servers from its own settings. When false, the hook adds `--strict-mcp-config` so only the Hermes bridge is visible, or no MCP servers are visible when `mcp_enabled` is also false. |
 | `max_mcp_output_tokens` | positive integer or `0` | `0` | `12000` | Sets `MAX_MCP_OUTPUT_TOKENS` for the subprocess when greater than `0`. |
 | `mcp_tool_result_char_limit` | positive integer or `0` | `0` | `60000` | Trims Hermes MCP tool results before returning them to Claude CLI; `0` disables trimming. |
+| `mcp_execute_code_timeout_seconds` | positive number | `45` | `30` | Overrides Hermes `execute_code` timeout only while Claude CLI calls it through the Hermes MCP bridge. Normal Hermes `execute_code` calls keep the core `code_execution.timeout` setting. |
 | `add_dirs` | list of strings or string | `[]` | `["/opt/shared"]` | Raw Claude CLI `--add-dir` directories. Use only when Claude CLI native context discovery needs extra directories. |
 | `plugin_dirs` | list of strings or string | `[]` | `["/opt/data/.claude/plugins/local"]` | Raw Claude CLI `--plugin-dir` values. |
 | `debug_filter` | string | `""` | `api,hooks` | Raw Claude CLI `--debug` filter. Empty means omit the flag. |
